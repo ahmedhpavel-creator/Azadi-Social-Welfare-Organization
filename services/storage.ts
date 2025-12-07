@@ -7,8 +7,8 @@ declare const firebase: any;
 
 const SEED_SETTINGS: AppSettings = {
     contactPhone: ORGANIZATION_INFO.contact.phone,
-    adminUser: 'admin', // Kept for display, but authentication is now handled by Firebase Auth
-    adminPassHash: '', // Deprecated in favor of Firebase Auth
+    adminUser: 'admin',
+    adminPassHash: '',
     socialLinks: {
         facebook: 'https://facebook.com',
         youtube: 'https://youtube.com',
@@ -68,34 +68,30 @@ const getDbRef = (path: string) => {
 };
 
 // --- AUTHENTICATION SERVICE ---
-// Hybrid system: Supports Real Firebase Auth AND Local Fallback for preview environments
 let localUser: any = null;
-// Try to load persisted local user
 const persistedUser = local.get('local_user_session', null);
 if (persistedUser) {
     localUser = persistedUser;
 }
 
 const authListeners: ((user: any) => void)[] = [];
-
 const notifyAuthListeners = (u: any) => authListeners.forEach(l => l(u));
 
 const auth = {
     login: async (email: string, pass: string) => {
         // PRIORITY CHECK: Hardcoded Admin Credential
-        // This bypasses Firebase completely to ensure access even if auth is disabled in console
         if ((email === 'admin' || email === 'admin@example.com') && pass === 'admin123') {
              localUser = { uid: 'local_admin', email: 'admin@example.com', displayName: 'Admin User' };
-             local.set('local_user_session', localUser); // Persist session
+             local.set('local_user_session', localUser);
              
-             // Reset offline mode to try connecting to DB (assuming rules are open)
+             // IMPORTANT: We explicitly set offline mode to FALSE here to allow
+             // the system to attempt a cloud connection since rules are set to true.
              setOfflineMode(false); 
              
              notifyAuthListeners(localUser);
              return { success: true, message: 'Logged in as Admin' };
         }
         
-        // Fix: Prevent invalid emails from hitting Firebase to avoid auth/invalid-email error
         if (!email.includes('@')) {
              return { success: false, message: 'Invalid username or password.' };
         }
@@ -116,7 +112,7 @@ const auth = {
     },
     logout: async () => {
         localUser = null;
-        local.set('local_user_session', null); // Clear persisted session
+        local.set('local_user_session', null);
         notifyAuthListeners(null);
         if (typeof firebase !== 'undefined') {
             await firebase.auth().signOut();
@@ -137,7 +133,6 @@ const auth = {
             return { success: false, message: e.message };
         }
     },
-    // Subscribe to BOTH Firebase and Local auth changes
     subscribe: (callback: (user: any) => void) => {
         authListeners.push(callback);
         let unsubscribe = () => {};
@@ -145,11 +140,10 @@ const auth = {
         if (typeof firebase !== 'undefined') {
              unsubscribe = firebase.auth().onAuthStateChanged((u: any) => {
                 if (u) {
-                    localUser = null; // Clear local fallback if real user exists
+                    localUser = null;
                     local.set('local_user_session', null);
                     callback(u);
                 } else {
-                    // If firebase says null, check if we have a local fallback
                     callback(localUser);
                 }
             });
@@ -168,7 +162,6 @@ const auth = {
 // --- API WRAPPER USING SDK ---
 const api = {
     get: async <T>(path: string, defaultVal: T): Promise<T> => {
-        // If we are in offline mode, just return local data immediately
         if (isOfflineMode) {
             return local.get<T>(path, defaultVal);
         }
@@ -178,15 +171,11 @@ const api = {
             const data = snapshot.val();
             
             if (data === null || data === undefined) {
-                 // Try local if cloud is empty
                  const localData = local.get<T>(path, defaultVal);
-                 // If local has data (and it's an array), prefer it over empty cloud result 
-                 // (helps with initial seed scenarios)
                  if (Array.isArray(localData) && (localData as any[]).length > 0) return localData;
                  return defaultVal;
             }
 
-            // Normalization logic (Object to Array)
             if (Array.isArray(defaultVal)) {
                 const result = Array.isArray(data) ? data : Object.values(data);
                 return result.filter((item: any) => item !== null && item !== undefined) as unknown as T;
@@ -199,34 +188,26 @@ const api = {
             return data as T;
         } catch (e: any) {
             console.warn(`Cloud fetch failed for ${path}:`, e);
-            // Check for permission denied or network error
-            if (e.code === 'PERMISSION_DENIED' || e.code === 'CLIENT_OFFLINE') {
-                 if (e.code === 'PERMISSION_DENIED') {
-                     // Note: PERMISSION_DENIED on read might mean auth issue, but public read is usually on
-                     console.warn("Permission denied. Ensure database rules allow read.");
-                 }
-            }
+            // Only fall back to local if it's a genuine network/permission error
+            // AND we aren't explicitly trying to test connection
             return local.get<T>(path, defaultVal);
         }
     },
     
     put: async (path: string, data: any) => {
         const parts = path.split('/');
-        // Optimistic Local Update
         if (parts[1]) local.updateItem(parts[0], parts[1], data);
         else local.set(parts[0], data);
 
-        if (isOfflineMode) return;
-
+        // Always try to save to cloud even if marked offline temporarily, 
+        // unless explicitly disabled. This allows 'retry' to work.
         try {
             await getDbRef(path).set(data);
+            if(isOfflineMode) setOfflineMode(false); // Recovery
         } catch (e: any) {
             console.warn(`Cloud save failed for ${path}`, e);
-            if (e.code === 'PERMISSION_DENIED') {
-                 console.warn("Permission Denied: User might not be authenticated.");
-                 setOfflineMode(true);
-            }
-            throw e; // Re-throw to let UI know
+            // Don't set offline mode immediately on write fail, allow retries
+            throw e; 
         }
     },
 
@@ -234,13 +215,11 @@ const api = {
         const parts = path.split('/');
         if (parts[1]) local.updateItem(parts[0], parts[1], data, true);
         
-        if (isOfflineMode) return;
-
         try {
              await getDbRef(path).update(data);
+             if(isOfflineMode) setOfflineMode(false);
         } catch (e: any) {
              console.warn(`Cloud patch failed for ${path}`, e);
-             if (e.code === 'PERMISSION_DENIED') setOfflineMode(true);
              throw e;
         }
     },
@@ -249,24 +228,19 @@ const api = {
         const parts = path.split('/');
         if (parts[1]) local.deleteItem(parts[0], parts[1]);
 
-        if (isOfflineMode) return;
-
         try {
              await getDbRef(path).remove();
+             if(isOfflineMode) setOfflineMode(false);
         } catch (e: any) {
             console.warn(`Cloud delete failed for ${path}`, e);
-            if (e.code === 'PERMISSION_DENIED') setOfflineMode(true);
             throw e;
         }
     }
 };
 
 export const storage = {
-    auth, // Export auth methods
-    // Expose status for UI
+    auth,
     isOffline: () => isOfflineMode,
-    
-    // Subscribe to status changes
     subscribeToStatus: (callback: (isOffline: boolean) => void) => {
         listeners.push(callback);
         return () => {
@@ -278,14 +252,13 @@ export const storage = {
     // Manually check connection status
     checkConnection: async () => {
         try {
-            // Bypass cloud check if in local admin mode to prevent permission denied error
-            if (localUser && localUser.uid === 'local_admin') {
-                return { success: true, message: 'Local Mode Active' };
-            }
-
             if (typeof firebase === 'undefined') return { success: false, message: 'Firebase SDK missing' };
+            
+            // ATTEMPT REAL CONNECTION regardless of user type
+            // This ensures we test if the rules (read: true, write: true) are actually working
             await getDbRef('_connection_test').set({ timestamp: Date.now() });
-            setOfflineMode(false); // Reset offline mode if successful
+            
+            setOfflineMode(false); 
             return { success: true, message: 'Connected' };
         } catch (e: any) {
             console.error("Connection check failed", e);
@@ -295,7 +268,6 @@ export const storage = {
         }
     },
 
-    // Retry connection
     retryConnection: () => {
         setOfflineMode(false);
         return storage.checkConnection();
@@ -325,13 +297,10 @@ export const storage = {
     getLeaders: async () => {
         try {
             const leaders = await api.get<Leader[]>('leaders', []);
-            
-            // Seed logic with hybrid support
             if ((!leaders || leaders.length === 0) && MOCK_LEADERS.length > 0) {
                  const currentLocal = local.get<Leader[]>('leaders', []);
                  if (currentLocal.length === 0) {
-                    console.log("Seeding database...");
-                    // Try to seed regardless of user state (relying on rules)
+                    // Seed if empty
                     for (const l of MOCK_LEADERS) {
                         await api.put(`leaders/${l.id}`, l);
                     }
@@ -341,24 +310,23 @@ export const storage = {
             }
             return leaders;
         } catch (e) {
-            console.error("Leader fetch/seed error", e);
             return MOCK_LEADERS;
         }
     },
     saveLeader: (leader: Leader) => api.put(`leaders/${leader.id}`, leader),
     deleteLeader: (id: string) => api.delete(`leaders/${id}`),
 
-    // --- MEMBER MANAGEMENT ---
+    // --- MEMBERS ---
     getMembers: () => api.get<Member[]>('members', []),
     saveMember: (member: Member) => api.put(`members/${member.id}`, member),
     deleteMember: (id: string) => api.delete(`members/${id}`),
 
-    // --- EVENT MANAGEMENT ---
+    // --- EVENTS ---
     getEvents: () => api.get<Event[]>('events', []),
     saveEvent: (event: Event) => api.put(`events/${event.id}`, event),
     deleteEvent: (id: string) => api.delete(`events/${id}`),
     
-    // --- GALLERY MANAGEMENT ---
+    // --- GALLERY ---
     getGallery: () => api.get<GalleryItem[]>('gallery', []),
     saveGalleryItem: (item: GalleryItem) => api.put(`gallery/${item.id}`, item),
     deleteGalleryItem: (id: string) => api.delete(`gallery/${id}`),
