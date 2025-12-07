@@ -1,0 +1,5 @@
+{
+  "name": "Azadi Social Welfare Organization 12.08.25",
+  "description": "A bilingual (Bangla/English) social welfare organization platform featuring donation management, event tracking, leader profiles, and an administrative dashboard with accounting visualization. Built as a responsive SPA simulating a full stack environment using local storage for persistence.",
+  "requestFramePermissions": []
+}
